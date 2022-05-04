@@ -6,6 +6,8 @@
 #include <DS1307RTC.h>
 #include <EEPROM.h>
 #include <Time.h>
+#include <avr/sleep.h>
+#include <avr/power.h>
 
 tmElements_t datetime;
 
@@ -19,6 +21,9 @@ tmElements_t datetime;
 #define numberOfHours(_time_) ((_time_ % SECS_PER_DAY) / SECS_PER_HOUR)
 #define elapsedDays(_time_) (_time_ / SECS_PER_DAY)
 #define showNoShow(_time_) (_time_ % 2 == 0)
+#define battery_find(_val_) ((_val_ * 5. / 1023. - 3) / 1.2 * 100)
+#define SLEEP_CONST  100
+volatile int count_sleep = SLEEP_CONST;
 
 int a_type_of_show = 0; // адрес eeprom
 int a_light_level = 1;
@@ -34,7 +39,9 @@ bool select = false;
 bool switch_screen = false;
 bool light = true;
 int type_of_show = EEPROM.read(a_type_of_show);
-
+float battary_voltage = battery_find(analogRead(A0));
+bool higth_freq = true;
+int hight_freq_set_count = 0;
 byte LT[8] =
     {
         B00111,
@@ -150,7 +157,12 @@ void clean_display()
 
 int seconds()
 {
-  return numberOfSeconds(long(millis() / 1000.));
+  if (higth_freq)
+  {
+    return numberOfSeconds(long(millis() / 1000.));
+  }
+  else
+    return numberOfSeconds(long(millis() / 1000.)) * 4;
 }
 
 class Menu
@@ -195,11 +207,11 @@ public:
       break;
     }
 
-    if ((cursor_position == 4) && (select && (level_menu == 0)))
-    {
-      cursor_position = 0;
-      return false;
-    }
+    // if ((cursor_position == 4) && (select && (level_menu == 0)))
+    // {
+    //   cursor_position = 0;
+    //   return false;
+    // }
     if (select && (level_menu != 10))
     {
       cursor_position = 0;
@@ -439,12 +451,23 @@ private:
   void main_menu(bool cursor_position_shift, bool select)
   {
     cursor_position += int(cursor_position_shift);
-    if (cursor_position >= 5)
+    if (cursor_position >= 4)
       cursor_position = 0;
     for (auto i = 0; i < 2; ++i)
     {
       lcd.setCursor(0, i);
-      lcd.print(menu[i + cursor_position]);
+
+      if (i + cursor_position != 4)
+      {
+        lcd.print(menu[i + cursor_position]);
+      }
+      else
+      {
+        lcd.print("Bat ");
+        lcd.print(battary_voltage, 0);
+        lcd.print(";V: ");
+        lcd.print(5. * analogRead(A0) / 1023, 2);
+      }
       if (i == 0)
         lcd.print("<-");
     }
@@ -709,10 +732,38 @@ void printNumber(int val, int col = 9)
   printDigits(val % 10, col + 4);
 }
 
+void low_freq_set()
+{
+  if (higth_freq)
+  {
+    CLKPR = 1 << CLKPCE;
+    CLKPR = 4;
+  }
+  higth_freq = false;
+}
+
+void hight_freq_set()
+{
+  if (!higth_freq)
+  {
+    CLKPR = 1 << CLKPCE;
+    CLKPR = 0;
+  }
+  higth_freq = true;
+}
+
+void isr()
+{
+  count_sleep = SLEEP_CONST; // Инициализировать счётчик
+}
 void setup()
 {
-  pinMode(6, OUTPUT);
+  // clock_prescale_set(clock_div_16);
+  digitalWrite(13, LOW); // (3) Светодиод гаснет при нажатии кнопки.
+
+  //pinMode(6, OUTPUT);
   pinMode(2, INPUT); // объявляем пин 2 как вход
+  pinMode(3, INPUT_PULLUP); // объявляем пин 2 как вход
   lcd.init();        // инициализация LCD дисплея
   lcd.backlight();   // включение подсветки дисплея
   lcd.createChar(0, LT);
@@ -724,21 +775,32 @@ void setup()
   lcd.createChar(6, MB);
   lcd.createChar(7, block);
 
-  timer = seconds();
+  // timer = seconds();
   bme.begin();
+  pinMode(A0, INPUT);
+
+  show_menu_status = false;
+  attachInterrupt(1, isr, FALLING);
+
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+  low_freq_set();
+  //sleep_mode();
   // EEPROM.write(address, 0);
 }
 
 // Обновление дисплея:
 // 1. Очистка экрана
 // 2. Новая информация
-
+bool blacklight_status = true;
 void loop()
 {
-  analogWrite(6, 200);
+  
+  analogWrite(6, 150);
 
   if (digitalRead(2) == HIGH)
   {
+    hight_freq_set_count = 10;
+    hight_freq_set();
     if ((!shift_cursor))
       shift_cursor = true;
 
@@ -782,7 +844,7 @@ void loop()
 
     if (show_menu_status)
     {
-      show_menu_status = menu.show_menu(shift_cursor, select);
+      menu.show_menu(shift_cursor, select);
       if (!show_menu_status)
       {
         select = false;
@@ -790,6 +852,8 @@ void loop()
         show = true;
         show_timer = seconds();
         timer_stop = seconds();
+        timer = -1;
+        show_timer = 61;
         lcd.clear();
       }
       if (shift_cursor)
@@ -803,21 +867,24 @@ void loop()
     }
     else if ((type_of_show == 1) && show)
     {
-      if (switch_screen){
-      RTC.read(datetime);
-      lcd.setCursor(7, 0);
-      lcd.print(bme.readTemperature(), 0);
-      lcd.setCursor(7, 1);
-      lcd.print(bme.readHumidity(), 0);
-      printNumber(datetime.Hour, 0);
-      printNumber(datetime.Minute, 9);
+      if (!switch_screen)
+      {
+        RTC.read(datetime);
+        lcd.setCursor(7, 0);
+        lcd.print(bme.readTemperature(), 0);
+        lcd.setCursor(7, 1);
+        lcd.print(bme.readHumidity(), 0);
+        printNumber(datetime.Hour, 0);
+        printNumber(datetime.Minute, 9);
       }
-      else{
+      else
+      {
         lcd.setCursor(0, 0);
         lcd.print("Date");
         display_date(1, 0);
       }
-      if (shift_cursor){
+      if (shift_cursor)
+      {
         switch_screen = !switch_screen;
         shift_cursor = false;
         clean_display();
@@ -858,5 +925,52 @@ void loop()
   {
   }
   timer_stop = seconds();
-  show = abs(show_timer - timer_stop) >= 1;
+  // if (higth_freq)
+  show = abs(show_timer - timer_stop) >= 0;
+
+  // else
+  // show = timer_stop % 2==0; // abs(show_timer - timer_stop) >= 0;
+  if (timer_stop % 1 == 0)
+  {
+    battary_voltage = battery_find(analogRead(A0));
+    if (battary_voltage >= 90)
+      battary_voltage = 100;
+    else if (battary_voltage >= 75)
+      battary_voltage = 75;
+    else if (battary_voltage >= 50)
+      battary_voltage = 50;
+    else if (battary_voltage <= 25)
+      battary_voltage = 25;
+  }
+  if (hight_freq_set_count == 0)
+    low_freq_set();
+  else
+    hight_freq_set_count--;
+  if (count_sleep == 0)
+  {
+    clean_display();
+    lcd.setCursor(0, 0);
+    lcd.print("I will be");
+    lcd.setCursor(0, 1);
+    lcd.print("SLEEP");
+    delay(100);
+    clean_display();
+    lcd.noBacklight();
+    lcd.noDisplay();
+    blacklight_status = false;
+    sleep_mode();                                   // Переход в режим сна
+  }
+  else if (!show_menu_status && !higth_freq)
+  {
+
+    --count_sleep; // уменьшить счётчик на 1.
+  }
+  if (!blacklight_status){
+    lcd.backlight();
+    blacklight_status = true;
+    lcd.display();
+    }
+  
+  lcd.setCursor(0, 0);
+  lcd.print(count_sleep);
 }
